@@ -518,14 +518,15 @@ function assignIdleWorkers(
 }
 
 /**
- * The worker pass: the impure layer around the pure functions, the only
- * place that reads the simulation and posts gather orders.
+ * The worker pass: the impure layer around the pure functions, reads the
+ * simulation (read-only) and decides gather orders; OnUpdate posts them.
  * @param {object} worker_state — { assignment_by_worker_id,
  *   carried_amount_by_worker_id, measured_rate_by_worker_id,
  *   last_delivery_time_by_worker_id }.
- * @param {GameState} game_state — this player's game state.
+ * @param {GameState} game_state — this player's game state, read-only.
  * @param {number} turn — current bot turn, stamped into new rate records.
- * @returns {object} the updated worker_state.
+ * @returns {{state: object, orders: Array<{worker_id: number,
+ *   source_id: number}>}} the updated worker_state and the gather orders.
  */
 function manageWorkers(worker_state, game_state, turn) {
   // dict: worker id -> { resource, source_id, subtype }
@@ -700,6 +701,8 @@ function manageWorkers(worker_state, game_state, turn) {
     free_slots_by_resource,
     GATHER_WEIGHTS,
   );
+  // array of { worker_id, source_id }: gather orders for OnUpdate to post
+  const orders = [];
   if (new_assignments.length > 0) {
     // dict: resource name -> how many workers were assigned there this pass
     const assigned_count_by_resource = {};
@@ -710,7 +713,7 @@ function manageWorkers(worker_state, game_state, turn) {
       // Entity or undefined: source it should gather
       const source = game_state.getEntityById(pair.source_id);
       if (!worker || !source) continue;
-      worker.gather(source);
+      orders.push(pair);
       // object { generic, specific }: type of the chosen source
       const supply_type = source.resourceSupplyType();
       assignment_by_worker_id[pair.worker_id] = {
@@ -727,39 +730,82 @@ function manageWorkers(worker_state, game_state, turn) {
   }
 
   return {
-    assignment_by_worker_id,
-    carried_amount_by_worker_id,
-    measured_rate_by_worker_id,
-    last_delivery_time_by_worker_id,
+    state: {
+      assignment_by_worker_id,
+      carried_amount_by_worker_id,
+      measured_rate_by_worker_id,
+      last_delivery_time_by_worker_id,
+    },
+    orders: orders,
   };
 }
 
 /**
- * @param {object} construction_state — { pending_orders, failed_positions,
- *   uncoverable_source_by_id }.
+ * The generic construction order book: tracks the orders awaiting their
+ * foundation and the spots the engine rejected. Read-only on the game
+ * state; OnUpdate posts the orders and appends them to pending_orders.
+ * @param {object} construction_state — { pending_orders, failed_positions }.
+ * @param {GameState} game_state — this player's game state, read-only.
+ * @param {number} turn — current bot turn.
+ * @returns {object} the updated construction_state.
+ */
+function manageConstruction(construction_state, game_state, turn) {
+  // array of { x, z, kind, turn }: orders awaiting their foundation
+  let pending_orders = construction_state.pending_orders || [];
+  // array of [x, z]: spots the engine rejected
+  const failed_positions = construction_state.failed_positions || [];
+
+  // array of Entity: current foundations
+  const foundations = game_state.getOwnFoundations().toEntityArray();
+  pending_orders = pending_orders.filter((order) => {
+    // boolean: a foundation now stands on the ordered spot
+    const built = foundations.some(
+      (foundation) =>
+        foundation.position() &&
+        Math.abs(foundation.position()[0] - order.x) < 4 &&
+        Math.abs(foundation.position()[1] - order.z) < 4,
+    );
+    if (built) return false;
+    if (turn - order.turn > 50) {
+      failed_positions.push([order.x, order.z]);
+      return false;
+    }
+    return true;
+  });
+  if (failed_positions.length > 32) failed_positions.shift();
+  return {
+    pending_orders: pending_orders,
+    failed_positions: failed_positions,
+  };
+}
+
+/**
+ * The dropsite pass: plans resource dropoff points near the assigned
+ * sources. Read-only on the game state; OnUpdate posts the orders.
+ * @param {object} dropsite_state — { uncoverable_source_by_id }.
  * @param {object} worker_state — the updated worker state of this pass.
- * @param {GameState} game_state — this player's game state.
+ * @param {object} construction_state — the reconciled construction state:
+ *   { pending_orders, failed_positions }.
+ * @param {GameState} game_state — this player's game state, read-only.
  * @param {number} turn — current bot turn.
  * @param {number} player — this bot's player id.
  * @param {object} territory_map — territory map: { width, height, cellSize,
  *   data: Uint8Array }.
- * @returns {object} the updated construction_state.
+ * @returns {{state: {uncoverable_source_by_id: object},
+ *   orders: Array<{x: number, z: number, kind: string}>}}
  */
-function manageConstruction(
-  construction_state,
+function manageDropsites(
+  dropsite_state,
   worker_state,
+  construction_state,
   game_state,
   turn,
   player,
   territory_map,
 ) {
-  // array of { x, z, kind, turn }: orders awaiting their foundation
-  let pending_orders = construction_state.pending_orders || [];
-  // array of [x, z]: spots the engine rejected
-  let failed_positions = construction_state.failed_positions || [];
   // dict: source id -> turn it was marked un-coverable
   let uncoverable_source_by_id =
-    construction_state.uncoverable_source_by_id || {};
+    dropsite_state.uncoverable_source_by_id || {};
 
   // array of { pos, kind }: built dropsites and dropsite foundations
   const coverage_dropsites = [];
@@ -783,25 +829,6 @@ function manageConstruction(
           : undefined;
     if (kind) coverage_dropsites.push({ pos: pos, kind: kind });
   }
-
-  // array of Entity: current foundations
-  const foundations = game_state.getOwnFoundations().toEntityArray();
-  pending_orders = pending_orders.filter((order) => {
-    // boolean: a foundation now stands on the ordered spot
-    const built = foundations.some(
-      (foundation) =>
-        foundation.position() &&
-        Math.abs(foundation.position()[0] - order.x) < 4 &&
-        Math.abs(foundation.position()[1] - order.z) < 4,
-    );
-    if (built) return false;
-    if (turn - order.turn > 50) {
-      failed_positions.push([order.x, order.z]);
-      return false;
-    }
-    return true;
-  });
-  if (failed_positions.length > 32) failed_positions.shift();
 
   // dict: source id -> true, the unique assigned sources
   const assigned_source_by_id = {};
@@ -863,7 +890,10 @@ function manageConstruction(
   }
 
   // array of [x, z]: spots ordered in previous passes
-  const planned_positions = pending_orders.map((order) => [order.x, order.z]);
+  const planned_positions = construction_state.pending_orders.map((order) => [
+    order.x,
+    order.z,
+  ]);
   // object: { orders, uncoverable_source_by_id }
   const decision = planDropsites(
     assigned_sources,
@@ -871,31 +901,11 @@ function manageConstruction(
     supplies_by_generic,
     placement_by_kind,
     planned_positions,
-    failed_positions,
+    construction_state.failed_positions,
     uncoverable_source_by_id,
     turn,
   );
   uncoverable_source_by_id = decision.uncoverable_source_by_id;
-
-  // Entity or undefined: command carrier, any own unit works
-  const carrier = game_state.getOwnUnits().toEntityArray()[0];
-  // object { x, z, kind }: one order to post
-  for (const order of decision.orders) {
-    if (!carrier) break;
-    carrier.construct(
-      game_state.applyCiv("structures/{civ}/" + order.kind),
-      order.x,
-      order.z,
-      0,
-      undefined,
-    );
-    pending_orders.push({
-      x: order.x,
-      z: order.z,
-      kind: order.kind,
-      turn: turn,
-    });
-  }
 
   // string: source id as object key
   for (const source_id of Object.keys(uncoverable_source_by_id))
@@ -903,9 +913,8 @@ function manageConstruction(
       delete uncoverable_source_by_id[source_id];
 
   return {
-    pending_orders: pending_orders,
-    failed_positions: failed_positions,
-    uncoverable_source_by_id: uncoverable_source_by_id,
+    state: { uncoverable_source_by_id: uncoverable_source_by_id },
+    orders: decision.orders,
   };
 }
 
@@ -918,7 +927,7 @@ LouisBot.prototype.CustomInit = function (gameState) {
 
 /**
  * The top of the call stack: reads and writes the bot state, each concern
- * lives in its own pass below.
+ * lives in its own pass below, and every engine command is posted here.
  * No parameters.
  */
 LouisBot.prototype.OnUpdate = function () {
@@ -938,21 +947,72 @@ LouisBot.prototype.OnUpdate = function () {
   // object: { assignment_by_worker_id, carried_amount_by_worker_id,
   //   measured_rate_by_worker_id, last_delivery_time_by_worker_id }
   const worker_state = this.worker_state ?? saved_state?.worker_state ?? {};
-  // object: { pending_orders, failed_positions, uncoverable_source_by_id }
+  // object: { pending_orders, failed_positions }
   const construction_state =
     this.construction_state ?? saved_state?.construction_state ?? {};
+  // object: { uncoverable_source_by_id }
+  const dropsite_state =
+    this.dropsite_state ?? saved_state?.dropsite_state ?? {};
 
-  // object: the worker state updated by this pass
-  const new_worker_state = manageWorkers(worker_state, game_state, turn);
-  this.worker_state = new_worker_state;
-  this.construction_state = manageConstruction(
+  // object: { state, orders }: the worker pass result
+  const worker_result = manageWorkers(worker_state, game_state, turn);
+  this.worker_state = worker_result.state;
+  // object { worker_id, source_id }: one gather order
+  for (const order of worker_result.orders) {
+    // Entity or undefined: worker to order
+    const worker = game_state.getEntityById(order.worker_id);
+    // Entity or undefined: source it should gather
+    const source = game_state.getEntityById(order.source_id);
+    if (worker && source) worker.gather(source);
+  }
+
+  // object: { pending_orders, failed_positions }, reconciled order book
+  const new_construction_state = manageConstruction(
     construction_state,
-    new_worker_state,
+    game_state,
+    turn,
+  );
+
+  // object: { state, orders }: the dropsite pass result
+  const dropsite_result = manageDropsites(
+    dropsite_state,
+    this.worker_state,
+    new_construction_state,
     game_state,
     turn,
     this.player,
     this.territoryMap,
   );
+  this.dropsite_state = dropsite_result.state;
+
+  // Entity or undefined: command carrier, any own unit works
+  const carrier = game_state.getOwnUnits().toEntityArray()[0];
+  // array of { x, z, kind, turn }: the orders actually posted
+  const posted_orders = [];
+  // object { x, z, kind }: one order to post
+  for (const order of dropsite_result.orders) {
+    if (!carrier) break;
+    carrier.construct(
+      game_state.applyCiv("structures/{civ}/" + order.kind),
+      order.x,
+      order.z,
+      0,
+      undefined,
+    );
+    posted_orders.push({
+      x: order.x,
+      z: order.z,
+      kind: order.kind,
+      turn: turn,
+    });
+  }
+  this.construction_state = {
+    pending_orders: [
+      ...new_construction_state.pending_orders,
+      ...posted_orders,
+    ],
+    failed_positions: new_construction_state.failed_positions,
+  };
   this.turn = turn + 1;
 };
 
@@ -964,6 +1024,7 @@ LouisBot.prototype.Serialize = function () {
   return {
     worker_state: this.worker_state,
     construction_state: this.construction_state,
+    dropsite_state: this.dropsite_state,
   };
 };
 
