@@ -1,6 +1,6 @@
 {
 	"name": "Louis — bot",
-	"description": "At the start of the game, finds the food cluster (a 20 m circle with at least 500 food) closest to the civic centre and builds a farmstead minimizing the walking distance to every source in the cluster.",
+	"description": "Assigns idle workers to resource sources, balancing food and wood against measured gather rates. Does not build anything yet.",
 	"constructor": "LouisBot",
 	"filename": "louis_bot.js",
 	"useShared": true

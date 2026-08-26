@@ -2,7 +2,7 @@
 
 An in-engine JavaScript AI bot for [0 A.D.](https://play0ad.com/) (0.28.0), shipped as a mod.
 
-At the start of the game, the bot finds the food cluster (a 20 m circle with at least 500 food) closest to the civic centre and builds a farmstead minimizing the walking distance to every source in the cluster.
+The bot assigns its idle workers to resource sources, balancing food and wood against measured gather rates. It does not build anything yet.
 
 ## Layout
 
