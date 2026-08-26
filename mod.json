@@ -1,0 +1,7 @@
+{
+	"name": "louis_bot",
+	"version": "0.1.0",
+	"label": "Louis Bot",
+	"description": "In-engine JS AI bot for 0 A.D. At game start, finds the food cluster closest to the civic centre and builds a farmstead minimizing walking distance to every source in the cluster.",
+	"dependencies": ["0ad=0.28.0"]
+}
