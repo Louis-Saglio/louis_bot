@@ -1,17 +1,3 @@
-/**
- * Deliberately minimal: no builder fallback and no replacement of dead
- * builders, because a proper building manager will be designed later.
- * Consequence to know when reading the logs: a foundation whose builders
- * all die stays unfinished forever, since the emitting pass counts the
- * foundation as coverage and stops re-emitting.
- * @param {object} construction_state — { builder_ids_by_foundation_id,
- *   pending_placements }.
- * @param {Array<{template: string, x: number, z: number, angle: number,
- *   builders: Array<number>}>} construction_orders — orders approved by the
- *   budget allocation this turn.
- * @param {GameState} game_state — this player's game state, read-only.
- * @returns {{state: object, directives: Array<object>}}
- */
 export function executeConstruction(
   construction_state,
   construction_orders,
@@ -21,10 +7,7 @@ export function executeConstruction(
   const builder_ids_by_foundation_id = {
     ...(construction_state.builder_ids_by_foundation_id || {}),
   };
-  // array of { template, x, z, angle, builders }: placements ordered on the
-  // previous play turn, awaiting their foundation; the construct command
-  // takes effect one turn later, so matching happens on this turn at the
-  // earliest
+  // array of { template, x, z, angle, builders }
   const unmatched_placements = [
     ...(construction_state.pending_placements || []),
   ];
@@ -40,12 +23,11 @@ export function executeConstruction(
     // [number, number] or undefined: foundation position, [x, z]
     const pos = structure.position();
     if (!pos) continue;
-    // number: index into unmatched_placements of the order that spawned
-    // this foundation, -1 if none
+    // number: index into unmatched_placements of the matching order, -1 if none
     let match_index = -1;
     // number: loop index into unmatched_placements
     for (let i = 0; i < unmatched_placements.length; i++) {
-      // object { template, x, z, angle, builders }: one pending placement
+      // object: { template, x, z, angle, builders }
       const pending = unmatched_placements[i];
       if (structure.templateName() !== "foundation|" + pending.template)
         continue;
@@ -70,9 +52,8 @@ export function executeConstruction(
   for (const [foundation_id, builder_ids] of Object.entries(
     builder_ids_by_foundation_id,
   )) {
-    // Entity or undefined: the foundation
+    // Entity or undefined
     const foundation = game_state.getEntityById(+foundation_id);
-    // A missing entity means destroyed, undefined progress means completed.
     if (!foundation || foundation.foundationProgress() === undefined) {
       delete builder_ids_by_foundation_id[foundation_id];
       continue;
@@ -88,13 +69,10 @@ export function executeConstruction(
     }
   }
 
-  // array of { template, x, z, angle, builders }: this turn's placements,
-  // matched against foundations on a later turn
+  // array of { template, x, z, angle, builders }
   const new_pending_placements = [];
-  // object { template, x, z, angle, builders }: one approved order
+  // object: { template, x, z, angle, builders }
   for (const order of construction_orders) {
-    // The construct command is posted from an entity, so an order without
-    // builders cannot even place its foundation.
     if (order.builders.length === 0) {
       print(
         `[HARNESS] louis-bot: construction order for ${order.template} has no builders, skipped\n`,

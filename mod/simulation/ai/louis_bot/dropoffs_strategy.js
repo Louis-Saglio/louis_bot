@@ -10,26 +10,12 @@ const DROPOFF_SEARCH_RADIUS = 40;
 // number: meters; step between candidate spots in the placement search
 const DROPOFF_SEARCH_STEP = 2;
 
-/**
- * Union-find over supplies: two supplies closer than CLUSTER_RADIUS belong
- * to the same cluster, so cluster boundaries follow tree spacing instead of
- * a fixed area. The centroid is weighted by remaining supply so exhausted
- * trees stop pulling the site.
- * @param {Array<{id: number, x: number, z: number, amount: number}>} supplies
- * @returns {Array<{supply_ids: Array<number>, supply_sum: number,
- *   x: number, z: number}>} clusters with supply-weighted centroids.
- */
 function clusterSupplies(supplies) {
-  // array of { id, x, z, amount }: sorted so the result is deterministic
+  // array of { id, x, z, amount }
   const sorted = [...supplies].sort((a, b) => a.id - b.id);
   // array of number: union-find parent per supply index
   const parent = sorted.map((unused, i) => i);
 
-  /**
-   * Finds the root of a supply index, compressing the path.
-   * @param {number} i — supply index.
-   * @returns {number}
-   */
   function find(i) {
     while (parent[i] !== i) {
       parent[i] = parent[parent[i]];
@@ -75,7 +61,7 @@ function clusterSupplies(supplies) {
     accumulator.weight_z += sorted[i].z * sorted[i].amount;
   }
 
-  // array of cluster records: the result
+  // array of cluster records
   const clusters = [];
   // object: one cluster accumulator
   for (const accumulator of Object.values(accumulator_by_root))
@@ -88,21 +74,8 @@ function clusterSupplies(supplies) {
   return clusters;
 }
 
-/**
- * Approximates the engine's placement check with the AI-visible grids:
- * every passability cell under the footprint must be free for the
- * building-land class (no obstruction, no water, flat enough) and the
- * center cell must be own territory. The AI grids can lag the engine's by
- * a few turns, so a spot passing here can still be rejected silently;
- * applyDropoffsStrategy then retries with the next-best spot.
- * @param {GameState} game_state — this player's game state, read-only.
- * @param {number} x — candidate center.
- * @param {number} z — candidate center.
- * @param {number} half_size — half the footprint side plus margin, meters.
- * @returns {boolean}
- */
 function isBuildableSpot(game_state, x, z, half_size) {
-  // object: { data, width, height, cellSize }: the pathfinder grid
+  // object: { data, width, height, cellSize }
   const passability = game_state.getPassabilityMap();
   // number: mask of the passability class used for land buildings
   const blocked_mask = game_state.getPassabilityClassMask("building-land");
@@ -125,7 +98,7 @@ function isBuildableSpot(game_state, x, z, half_size) {
       if (passability.data[cell] & blocked_mask) return false;
     }
   }
-  // object: { data, width, height, cellSize }: the territory grid
+  // object: { data, width, height, cellSize }
   const territory = game_state.sharedScript.territoryMap;
   // number: territory cell index of the candidate center
   const territory_cell =
@@ -138,21 +111,9 @@ function isBuildableSpot(game_state, x, z, half_size) {
     territory_cell >= territory.data.length
   )
     return false;
-  // The low 5 bits hold the owning player id, 0 means unowned.
   return (territory.data[territory_cell] & 0x1f) === game_state.player;
 }
 
-/**
- * Ring search around the centroid, nearest valid spot first, so the
- * storehouse lands as close to the trees as placement rules allow.
- * @param {GameState} game_state — this player's game state, read-only.
- * @param {number} cx — cluster centroid.
- * @param {number} cz — cluster centroid.
- * @param {number} half_size — half the footprint side plus margin, meters.
- * @param {Array<{x: number, z: number}>} rejected_positions — spots that
- *   already failed silently; skipped so each retry tries the next-best one.
- * @returns {{x: number, z: number}|undefined}
- */
 function findDropoffSpot(game_state, cx, cz, half_size, rejected_positions) {
   // number: distance of the current candidate ring from the centroid
   for (
@@ -182,23 +143,12 @@ function findDropoffSpot(game_state, cx, cz, half_size, rejected_positions) {
   return undefined;
 }
 
-/**
- * The dropoff pass. Keeps track of attempted spots because construct
- * rejection is silent: a spot that produced no foundation by the next turn
- * is skipped from then on.
- * @param {object} dropoff_state — { attempted, rejected }.
- * @param {object} assignment_by_worker_id — worker id -> { resource,
- *   source_id, subtype }, from the worker pass state.
- * @param {GameState} game_state — this player's game state, read-only.
- * @returns {{state: object, requests: Array<object>}} the updated
- *   dropoff_state and the construct spending requests.
- */
 export function applyDropoffsStrategy(
   dropoff_state,
   assignment_by_worker_id,
   game_state,
 ) {
-  // array of { id, x, z, amount }: wood supplies worth clustering
+  // array of { id, x, z, amount }
   const supplies = [];
   // Entity: one wood supply
   for (const supply of game_state.getResourceSupplies("wood").values()) {
@@ -213,28 +163,26 @@ export function applyDropoffsStrategy(
   // array of cluster records
   const clusters = clusterSupplies(supplies);
 
-  // array of { x, z }: own wood dropsites
+  // array of { x, z }
   const dropsites = [];
-  // array of { x, z }: own foundations of any kind
+  // array of { x, z }
   const foundations = [];
   // Entity: one own structure
   for (const structure of game_state.getOwnStructures().values()) {
     // [number, number] or undefined: structure position, [x, z]
     const pos = structure.position();
     if (!pos) continue;
-    // Foundations carry the built template's classes, so storehouse
-    // foundations count as coverage too.
     if (structure.hasClass("Storehouse") || structure.hasClass("CivCentre"))
       dropsites.push({ x: pos[0], z: pos[1] });
     if (structure.foundationProgress() !== undefined)
       foundations.push({ x: pos[0], z: pos[1] });
   }
 
-  // array of { x, z }: spots ordered on the previous play turn
+  // array of { x, z }
   const previously_attempted = dropoff_state.attempted || [];
-  // array of { x, z }: spots that never produced a foundation
+  // array of { x, z }
   const rejected = [...(dropoff_state.rejected || [])];
-  // object { x, z }: one previously attempted spot
+  // object: { x, z }
   for (const attempted_spot of previously_attempted) {
     // boolean: whether a foundation now stands on this spot
     const placed = foundations.some(
@@ -246,7 +194,7 @@ export function applyDropoffsStrategy(
     if (!placed) rejected.push(attempted_spot);
   }
 
-  // dict: source id -> array of worker ids assigned to it
+  // dict: source id -> array of worker ids
   const worker_ids_by_source_id = {};
   // [string, object]: worker id and its assignment record
   for (const [worker_id, assignment] of Object.entries(
@@ -259,7 +207,7 @@ export function applyDropoffsStrategy(
 
   // string: this civ's storehouse template name
   const template_name = "structures/" + game_state.getPlayerCiv() + "/storehouse";
-  // Template or null: the storehouse template
+  // Template or null
   const storehouse_template = game_state.getTemplate(template_name);
   if (!storehouse_template) return { state: dropoff_state, requests: [] };
   // object: resource name -> amount, only non-zero costs
@@ -277,7 +225,7 @@ export function applyDropoffsStrategy(
 
   // array of spending request objects
   const requests = [];
-  // array of { x, z }: spots ordered this turn
+  // array of { x, z }
   const attempted = [];
   // object: one cluster record
   for (const cluster of clusters) {
@@ -298,10 +246,8 @@ export function applyDropoffsStrategy(
         DROPOFF_COVERAGE_RADIUS * DROPOFF_COVERAGE_RADIUS,
     );
     if (covered) continue;
-    // The engine charges the real stock at command processing and rejects
-    // silently when it is short, so do not emit what cannot be afforded.
     if (wood_stock < storehouse_cost.wood) continue;
-    // object { x, z } or undefined: the nearest buildable spot
+    // object: { x, z } or undefined
     const spot = findDropoffSpot(
       game_state,
       cluster.x,

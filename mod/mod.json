@@ -2,5 +2,6 @@
 	"name": "louis_bot",
 	"version": "0.1.0",
 	"label": "Louis Bot",
+	"description": "",
 	"dependencies": ["0ad=0.28.0"]
 }
