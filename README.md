@@ -2,13 +2,13 @@
 
 An in-engine JavaScript AI bot for [0 A.D.](https://play0ad.com/) (0.28.0), shipped as a mod.
 
-The bot assigns its idle workers to resource sources, balancing food and wood against measured gather rates. It does not build anything yet.
+The bot assigns its idle workers to resource sources, balancing food and wood against measured gather rates, and builds storehouses near wood clusters that lack a dropsite.
 
 ## Layout
 
 - `mod/` — the 0 A.D. mod:
   - `mod.json` — mod manifest.
-  - `simulation/ai/louis_bot/` — the bot (`data.json` + `louis_bot.js`).
+  - `simulation/ai/louis_bot/` — the bot (`data.json`, `louis_bot.js` as the entry point, and one module per concern: `workers_strategy.js`, `dropoffs_strategy.js`, `budget_allocation.js`, `construction_execution.js`).
 - `docs/pyrogenesis_cli.md` — the 0 A.D. engine command line (headless usage).
 - `docs/ai_engine_api.md` — reference of the AI scripting API the bot uses.
 
