@@ -97,7 +97,10 @@ Add a `manageDropoffs` pass, in the codebase's pure/impure style:
 - The shared script maintains the resource supply collections
   (`game_state.getResourceSupplies(resource)`). No full map scan needed.
   The worker pass already uses them.
-- Storehouses are buildable outside own territory.
+- Storehouses require own territory in 0.28 (`Territory: own`, inherited
+  from `template_structure.xml`). A woodline centroid far from the CC may
+  sit outside it, so the placement snap must search until it finds a spot
+  that is both unobstructed and in own territory.
 - Validate placement against the live state. The AI territory grid can lag
   a few turns (`docs/ai_engine_api.md:835-836`).
 - The storehouse template name depends on the civ. Look it up from the

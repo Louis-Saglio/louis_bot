@@ -7,6 +7,18 @@ const GATHER_WEIGHTS = { food: 0.5, wood: 0.5, metal: 0, stone: 0 };
 // number: the bot plays every that many turns
 const PLAY_EVERY_N_TURN = 8;
 
+// number: meters; two wood supplies closer than this belong to one cluster
+const CLUSTER_RADIUS = 30;
+// number: meters; a cluster is covered when a wood dropsite, built or
+// foundation, sits this close to the cluster centroid
+const DROPOFF_COVERAGE_RADIUS = 40;
+// number: remaining wood below which a cluster never justifies a storehouse
+const MIN_CLUSTER_SUPPLY = 1500;
+// number: meters; how far from the centroid the placement search may wander
+const DROPOFF_SEARCH_RADIUS = 40;
+// number: meters; step between candidate spots in the placement search
+const DROPOFF_SEARCH_STEP = 2;
+
 /**
  * @param {object} settings — engine-provided player settings: { player,
  *   difficulty, behavior } (see the AI engine API docs).
@@ -510,6 +522,456 @@ function manageSpending(requests) {
 }
 
 /**
+ * Union-find over supplies: two supplies closer than CLUSTER_RADIUS belong
+ * to the same cluster, so cluster boundaries follow tree spacing instead of
+ * a fixed area. The centroid is weighted by remaining supply so exhausted
+ * trees stop pulling the site.
+ * @param {Array<{id: number, x: number, z: number, amount: number}>} supplies
+ * @returns {Array<{supply_ids: Array<number>, supply_sum: number,
+ *   x: number, z: number}>} clusters with supply-weighted centroids.
+ */
+function clusterSupplies(supplies) {
+  // array of { id, x, z, amount }: sorted so the result is deterministic
+  const sorted = [...supplies].sort((a, b) => a.id - b.id);
+  // array of number: union-find parent per supply index
+  const parent = sorted.map((unused, i) => i);
+
+  /**
+   * Finds the root of a supply index, compressing the path.
+   * @param {number} i — supply index.
+   * @returns {number}
+   */
+  function find(i) {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  }
+
+  // number: outer supply index
+  for (let i = 0; i < sorted.length; i++) {
+    // number: inner supply index
+    for (let j = i + 1; j < sorted.length; j++) {
+      // number: squared distance between the two supplies
+      const dist2 =
+        (sorted[i].x - sorted[j].x) * (sorted[i].x - sorted[j].x) +
+        (sorted[i].z - sorted[j].z) * (sorted[i].z - sorted[j].z);
+      if (dist2 > CLUSTER_RADIUS * CLUSTER_RADIUS) continue;
+      // number: roots of both supplies
+      const root_i = find(i);
+      const root_j = find(j);
+      if (root_i !== root_j) parent[root_i] = root_j;
+    }
+  }
+
+  // dict: root index -> { supply_ids, supply_sum, weight_x, weight_z }
+  const accumulator_by_root = {};
+  // number: supply index
+  for (let i = 0; i < sorted.length; i++) {
+    // number: root of this supply
+    const root = find(i);
+    if (!accumulator_by_root[root])
+      accumulator_by_root[root] = {
+        supply_ids: [],
+        supply_sum: 0,
+        weight_x: 0,
+        weight_z: 0,
+      };
+    // object: the cluster accumulator
+    const accumulator = accumulator_by_root[root];
+    accumulator.supply_ids.push(sorted[i].id);
+    accumulator.supply_sum += sorted[i].amount;
+    accumulator.weight_x += sorted[i].x * sorted[i].amount;
+    accumulator.weight_z += sorted[i].z * sorted[i].amount;
+  }
+
+  // array of cluster records: the result
+  const clusters = [];
+  // object: one cluster accumulator
+  for (const accumulator of Object.values(accumulator_by_root))
+    clusters.push({
+      supply_ids: accumulator.supply_ids,
+      supply_sum: accumulator.supply_sum,
+      x: accumulator.weight_x / accumulator.supply_sum,
+      z: accumulator.weight_z / accumulator.supply_sum,
+    });
+  return clusters;
+}
+
+/**
+ * Approximates the engine's placement check with the AI-visible grids:
+ * every passability cell under the footprint must be free for the
+ * building-land class (no obstruction, no water, flat enough) and the
+ * center cell must be own territory. The AI grids can lag the engine's by
+ * a few turns, so a spot passing here can still be rejected silently;
+ * manageDropoffs then retries with the next-best spot.
+ * @param {GameState} game_state — this player's game state, read-only.
+ * @param {number} x — candidate center.
+ * @param {number} z — candidate center.
+ * @param {number} half_size — half the footprint side plus margin, meters.
+ * @returns {boolean}
+ */
+function isBuildableSpot(game_state, x, z, half_size) {
+  // object: { data, width, height, cellSize }: the pathfinder grid
+  const passability = game_state.getPassabilityMap();
+  // number: mask of the passability class used for land buildings
+  const blocked_mask = game_state.getPassabilityClassMask("building-land");
+  // number: longitudinal offset from the candidate center
+  for (let dx = -half_size; dx <= half_size; dx += passability.cellSize) {
+    // number: latitudinal offset from the candidate center
+    for (let dz = -half_size; dz <= half_size; dz += passability.cellSize) {
+      // number: cell coordinates in the passability grid
+      const cell_x = Math.floor((x + dx) / passability.cellSize);
+      const cell_z = Math.floor((z + dz) / passability.cellSize);
+      if (
+        cell_x < 0 ||
+        cell_x >= passability.width ||
+        cell_z < 0 ||
+        cell_z >= passability.height
+      )
+        return false;
+      // number: cell index
+      const cell = cell_x + cell_z * passability.width;
+      if (passability.data[cell] & blocked_mask) return false;
+    }
+  }
+  // object: { data, width, height, cellSize }: the territory grid
+  const territory = game_state.sharedScript.territoryMap;
+  // number: territory cell index of the candidate center
+  const territory_cell =
+    Math.floor(x / territory.cellSize) +
+    Math.floor(z / territory.cellSize) * territory.width;
+  if (
+    x < 0 ||
+    z < 0 ||
+    territory_cell < 0 ||
+    territory_cell >= territory.data.length
+  )
+    return false;
+  // The low 5 bits hold the owning player id, 0 means unowned.
+  return (territory.data[territory_cell] & 0x1f) === game_state.player;
+}
+
+/**
+ * Ring search around the centroid, nearest valid spot first, so the
+ * storehouse lands as close to the trees as placement rules allow.
+ * @param {GameState} game_state — this player's game state, read-only.
+ * @param {number} cx — cluster centroid.
+ * @param {number} cz — cluster centroid.
+ * @param {number} half_size — half the footprint side plus margin, meters.
+ * @param {Array<{x: number, z: number}>} rejected_positions — spots that
+ *   already failed silently; skipped so each retry tries the next-best one.
+ * @returns {{x: number, z: number}|undefined}
+ */
+function findDropoffSpot(game_state, cx, cz, half_size, rejected_positions) {
+  // number: distance of the current candidate ring from the centroid
+  for (
+    let radius = 0;
+    radius <= DROPOFF_SEARCH_RADIUS;
+    radius += DROPOFF_SEARCH_STEP
+  ) {
+    // number: how many candidates sit on this ring; 1 for the center
+    const steps = radius === 0 ? 1 : 16;
+    // number: candidate index on this ring
+    for (let step = 0; step < steps; step++) {
+      // number: candidate coordinates
+      const x = cx + radius * Math.cos((step * 2 * Math.PI) / steps);
+      const z = cz + radius * Math.sin((step * 2 * Math.PI) / steps);
+      // boolean: whether this spot already failed
+      const is_rejected = rejected_positions.some(
+        (rejected) =>
+          (rejected.x - x) * (rejected.x - x) +
+            (rejected.z - z) * (rejected.z - z) <
+          1,
+      );
+      if (is_rejected) continue;
+      if (isBuildableSpot(game_state, x, z, half_size))
+        return { x: x, z: z };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The dropoff pass. Keeps track of attempted spots because construct
+ * rejection is silent: a spot that produced no foundation by the next turn
+ * is skipped from then on.
+ * @param {object} dropoff_state — { attempted, rejected }.
+ * @param {object} assignment_by_worker_id — worker id -> { resource,
+ *   source_id, subtype }, from the worker pass state.
+ * @param {GameState} game_state — this player's game state, read-only.
+ * @returns {{state: object, requests: Array<object>}} the updated
+ *   dropoff_state and the construct spending requests.
+ */
+function manageDropoffs(dropoff_state, assignment_by_worker_id, game_state) {
+  // array of { id, x, z, amount }: wood supplies worth clustering
+  const supplies = [];
+  // Entity: one wood supply
+  for (const supply of game_state.getResourceSupplies("wood").values()) {
+    // [number, number] or undefined: supply position, [x, z]
+    const pos = supply.position();
+    if (!pos) continue;
+    // number: remaining wood on this supply
+    const amount = supply.resourceSupplyAmount();
+    if (amount <= 0) continue;
+    supplies.push({ id: supply.id(), x: pos[0], z: pos[1], amount: amount });
+  }
+  // array of cluster records
+  const clusters = clusterSupplies(supplies);
+
+  // array of { x, z }: own wood dropsites
+  const dropsites = [];
+  // array of { x, z }: own foundations of any kind
+  const foundations = [];
+  // Entity: one own structure
+  for (const structure of game_state.getOwnStructures().values()) {
+    // [number, number] or undefined: structure position, [x, z]
+    const pos = structure.position();
+    if (!pos) continue;
+    // Foundations carry the built template's classes, so storehouse
+    // foundations count as coverage too.
+    if (structure.hasClass("Storehouse") || structure.hasClass("CivCentre"))
+      dropsites.push({ x: pos[0], z: pos[1] });
+    if (structure.foundationProgress() !== undefined)
+      foundations.push({ x: pos[0], z: pos[1] });
+  }
+
+  // array of { x, z }: spots ordered on the previous play turn
+  const previously_attempted = dropoff_state.attempted || [];
+  // array of { x, z }: spots that never produced a foundation
+  const rejected = [...(dropoff_state.rejected || [])];
+  // object { x, z }: one previously attempted spot
+  for (const attempted_spot of previously_attempted) {
+    // boolean: whether a foundation now stands on this spot
+    const placed = foundations.some(
+      (foundation) =>
+        (foundation.x - attempted_spot.x) * (foundation.x - attempted_spot.x) +
+          (foundation.z - attempted_spot.z) * (foundation.z - attempted_spot.z) <
+        1,
+    );
+    if (!placed) rejected.push(attempted_spot);
+  }
+
+  // dict: source id -> array of worker ids assigned to it
+  const worker_ids_by_source_id = {};
+  // [string, object]: worker id and its assignment record
+  for (const [worker_id, assignment] of Object.entries(
+    assignment_by_worker_id,
+  )) {
+    if (!worker_ids_by_source_id[assignment.source_id])
+      worker_ids_by_source_id[assignment.source_id] = [];
+    worker_ids_by_source_id[assignment.source_id].push(+worker_id);
+  }
+
+  // string: this civ's storehouse template name
+  const template_name = "structures/" + game_state.getPlayerCiv() + "/storehouse";
+  // Template or null: the storehouse template
+  const storehouse_template = game_state.getTemplate(template_name);
+  if (!storehouse_template) return { state: dropoff_state, requests: [] };
+  // object: resource name -> amount, only non-zero costs
+  const storehouse_cost = storehouse_template.cost();
+  // number: half the footprint side plus a margin, meters
+  const half_size =
+    Math.max(
+      +storehouse_template.get("Obstruction/Static/@width"),
+      +storehouse_template.get("Obstruction/Static/@depth"),
+    ) /
+      2 +
+    1;
+  // number: wood in stock
+  const wood_stock = game_state.playerData.resourceCounts.wood;
+
+  // array of spending request objects
+  const requests = [];
+  // array of { x, z }: spots ordered this turn
+  const attempted = [];
+  // object: one cluster record
+  for (const cluster of clusters) {
+    if (cluster.supply_sum < MIN_CLUSTER_SUPPLY) continue;
+    // array of number: ids of workers gathering in this cluster
+    const builders = [];
+    // number: one supply id of the cluster
+    for (const supply_id of cluster.supply_ids)
+      // number: one worker id assigned to this supply
+      for (const worker_id of worker_ids_by_source_id[supply_id] || [])
+        builders.push(worker_id);
+    if (builders.length === 0) continue;
+    // boolean: whether a dropsite already serves this cluster
+    const covered = dropsites.some(
+      (dropsite) =>
+        (dropsite.x - cluster.x) * (dropsite.x - cluster.x) +
+          (dropsite.z - cluster.z) * (dropsite.z - cluster.z) <
+        DROPOFF_COVERAGE_RADIUS * DROPOFF_COVERAGE_RADIUS,
+    );
+    if (covered) continue;
+    // The engine charges the real stock at command processing and rejects
+    // silently when it is short, so do not emit what cannot be afforded.
+    if (wood_stock < storehouse_cost.wood) continue;
+    // object { x, z } or undefined: the nearest buildable spot
+    const spot = findDropoffSpot(
+      game_state,
+      cluster.x,
+      cluster.z,
+      half_size,
+      rejected,
+    );
+    if (!spot) continue;
+    requests.push({
+      key: "dropsite:wood:cluster-" + cluster.supply_ids[0],
+      kind: "construct",
+      payload: {
+        template: template_name,
+        x: spot.x,
+        z: spot.z,
+        angle: 0,
+      },
+      cost: storehouse_cost,
+      builders: builders,
+      detail:
+        "woodline dropsite for a cluster of " +
+        cluster.supply_ids.length +
+        " supplies at (" +
+        cluster.x.toFixed(0) +
+        ", " +
+        cluster.z.toFixed(0) +
+        ")",
+    });
+    attempted.push({ x: spot.x, z: spot.z });
+  }
+  return {
+    state: { attempted: attempted, rejected: rejected },
+    requests: requests,
+  };
+}
+
+/**
+ * Deliberately minimal: no builder fallback and no replacement of dead
+ * builders, because a proper building manager will be designed later.
+ * Consequence to know when reading the logs: a foundation whose builders
+ * all die stays unfinished forever, since the emitting pass counts the
+ * foundation as coverage and stops re-emitting.
+ * @param {object} construction_state — { builder_ids_by_foundation_id,
+ *   pending_placements }.
+ * @param {Array<{template: string, x: number, z: number, angle: number,
+ *   builders: Array<number>}>} construction_orders — orders approved by the
+ *   spending manager this turn.
+ * @param {GameState} game_state — this player's game state, read-only.
+ * @returns {{state: object, directives: Array<object>}}
+ */
+function manageConstruction(
+  construction_state,
+  construction_orders,
+  game_state,
+) {
+  // dict: foundation id -> array of builder ids
+  const builder_ids_by_foundation_id = {
+    ...(construction_state.builder_ids_by_foundation_id || {}),
+  };
+  // array of { template, x, z, angle, builders }: placements ordered on the
+  // previous play turn, awaiting their foundation; the construct command
+  // takes effect one turn later, so matching happens on this turn at the
+  // earliest
+  const unmatched_placements = [
+    ...(construction_state.pending_placements || []),
+  ];
+  // array of directive objects
+  const directives = [];
+
+  // Entity: one own structure
+  for (const structure of game_state.getOwnStructures().values()) {
+    if (structure.foundationProgress() === undefined) continue;
+    // number: foundation entity id
+    const foundation_id = structure.id();
+    if (builder_ids_by_foundation_id[foundation_id] !== undefined) continue;
+    // [number, number] or undefined: foundation position, [x, z]
+    const pos = structure.position();
+    if (!pos) continue;
+    // number: index into unmatched_placements of the order that spawned
+    // this foundation, -1 if none
+    let match_index = -1;
+    // number: loop index into unmatched_placements
+    for (let i = 0; i < unmatched_placements.length; i++) {
+      // object { template, x, z, angle, builders }: one pending placement
+      const pending = unmatched_placements[i];
+      if (structure.templateName() !== "foundation|" + pending.template)
+        continue;
+      // number: squared horizontal distance to the ordered position
+      const dist2 =
+        (pos[0] - pending.x) * (pos[0] - pending.x) +
+        (pos[1] - pending.z) * (pos[1] - pending.z);
+      if (dist2 > 1) continue;
+      match_index = i;
+      break;
+    }
+    if (match_index === -1) continue;
+    builder_ids_by_foundation_id[foundation_id] =
+      unmatched_placements[match_index].builders;
+    unmatched_placements.splice(match_index, 1);
+    print(
+      `[HARNESS] louis-bot: foundation ${foundation_id} matched, ${builder_ids_by_foundation_id[foundation_id].length} builders assigned\n`,
+    );
+  }
+
+  // [string, Array<number>]: foundation id and its builder ids
+  for (const [foundation_id, builder_ids] of Object.entries(
+    builder_ids_by_foundation_id,
+  )) {
+    // Entity or undefined: the foundation
+    const foundation = game_state.getEntityById(+foundation_id);
+    // A missing entity means destroyed, undefined progress means completed.
+    if (!foundation || foundation.foundationProgress() === undefined) {
+      delete builder_ids_by_foundation_id[foundation_id];
+      continue;
+    }
+    // number: one builder id
+    for (const builder_id of builder_ids) {
+      if (!game_state.getEntityById(builder_id)) continue;
+      directives.push({
+        kind: "repair",
+        builder_id: builder_id,
+        foundation_id: +foundation_id,
+      });
+    }
+  }
+
+  // array of { template, x, z, angle, builders }: this turn's placements,
+  // matched against foundations on a later turn
+  const new_pending_placements = [];
+  // object { template, x, z, angle, builders }: one approved order
+  for (const order of construction_orders) {
+    // The construct command is posted from an entity, so an order without
+    // builders cannot even place its foundation.
+    if (order.builders.length === 0) {
+      print(
+        `[HARNESS] louis-bot: construction order for ${order.template} has no builders, skipped\n`,
+      );
+      continue;
+    }
+    directives.push({
+      kind: "construct",
+      template: order.template,
+      x: order.x,
+      z: order.z,
+      angle: order.angle,
+      builder_id: order.builders[0],
+    });
+    new_pending_placements.push(order);
+    print(
+      `[HARNESS] louis-bot: placing ${order.template} at (${order.x.toFixed(1)}, ${order.z.toFixed(1)}) with ${order.builders.length} builders\n`,
+    );
+  }
+
+  return {
+    state: {
+      builder_ids_by_foundation_id: builder_ids_by_foundation_id,
+      pending_placements: new_pending_placements,
+    },
+    directives: directives,
+  };
+}
+
+/**
  * @param {GameState} gameState — this player's game state.
  */
 LouisBot.prototype.CustomInit = function (gameState) {
@@ -538,19 +1000,42 @@ LouisBot.prototype.OnUpdate = function () {
   // object: { assignment_by_worker_id, carried_amount_by_worker_id,
   //   measured_rate_by_worker_id, last_delivery_time_by_worker_id }
   const worker_state = this.worker_state ?? saved_state?.worker_state ?? {};
+  // object: { builder_ids_by_foundation_id, pending_placements }
+  const construction_state =
+    this.construction_state ?? saved_state?.construction_state ?? {};
+  // object: { attempted, rejected }
+  const dropoff_state = this.dropoff_state ?? saved_state?.dropoff_state ?? {};
 
   // object: { state, directives, requests }: the worker pass result
   const worker_result = manageWorkers(worker_state, game_state, turn);
   this.worker_state = worker_result.state;
 
+  // object: { state, requests }: the dropoff pass result
+  const dropoff_result = manageDropoffs(
+    dropoff_state,
+    worker_result.state.assignment_by_worker_id,
+    game_state,
+  );
+  this.dropoff_state = dropoff_result.state;
+
   // array of spending request objects: from every pass
-  const requests = [...worker_result.requests];
-  // object { construction_orders: array }: kept for the building manager
-  // (ticket 002), unused until then
+  const requests = [...worker_result.requests, ...dropoff_result.requests];
+  // object { construction_orders: array }: the spending manager result
   const spending_result = manageSpending(requests);
 
-  // array of directive objects: from every pass
-  const directives = [...worker_result.directives];
+  // object: { state, directives }: the building manager result
+  const construction_result = manageConstruction(
+    construction_state,
+    spending_result.construction_orders,
+    game_state,
+  );
+  this.construction_state = construction_result.state;
+
+  // array of directive objects: from every pass and executor
+  const directives = [
+    ...worker_result.directives,
+    ...construction_result.directives,
+  ];
   // object: one directive
   for (const directive of directives) {
     if (directive.kind === "gather") {
@@ -559,6 +1044,22 @@ LouisBot.prototype.OnUpdate = function () {
       // Entity or undefined: source it should gather
       const source = game_state.getEntityById(directive.source_id);
       if (worker && source) worker.gather(source);
+    } else if (directive.kind === "construct") {
+      // Entity or undefined: the builder posting the placement
+      const poster = game_state.getEntityById(directive.builder_id);
+      if (poster)
+        poster.construct(
+          directive.template,
+          directive.x,
+          directive.z,
+          directive.angle,
+        );
+    } else if (directive.kind === "repair") {
+      // Entity or undefined: the builder
+      const builder = game_state.getEntityById(directive.builder_id);
+      // Entity or undefined: the foundation to raise
+      const foundation = game_state.getEntityById(directive.foundation_id);
+      if (builder && foundation) builder.repair(foundation);
     }
   }
 
@@ -572,6 +1073,8 @@ LouisBot.prototype.OnUpdate = function () {
 LouisBot.prototype.Serialize = function () {
   return {
     worker_state: this.worker_state,
+    construction_state: this.construction_state,
+    dropoff_state: this.dropoff_state,
   };
 };
 
