@@ -246,14 +246,16 @@ function assignIdleWorkers(
 
 /**
  * The worker pass: the impure layer around the pure functions, reads the
- * simulation (read-only) and decides gather orders; OnUpdate posts them.
+ * simulation (read-only) and emits gather directives; OnUpdate posts them.
  * @param {object} worker_state — { assignment_by_worker_id,
  *   carried_amount_by_worker_id, measured_rate_by_worker_id,
  *   last_delivery_time_by_worker_id }.
  * @param {GameState} game_state — this player's game state, read-only.
  * @param {number} turn — current bot turn, stamped into new rate records.
- * @returns {{state: object, orders: Array<{worker_id: number,
- *   source_id: number}>}} the updated worker_state and the gather orders.
+ * @returns {{state: object, directives: Array<{kind: string,
+ *   worker_id: number, source_id: number}>, requests: Array<object>}} the
+ *   updated worker_state, the gather directives, and this pass's spending
+ *   requests (none for now).
  */
 function manageWorkers(worker_state, game_state, turn) {
   // dict: worker id -> { resource, source_id, subtype }
@@ -428,8 +430,8 @@ function manageWorkers(worker_state, game_state, turn) {
     free_slots_by_resource,
     GATHER_WEIGHTS,
   );
-  // array of { worker_id, source_id }: gather orders for OnUpdate to post
-  const orders = [];
+  // array of { kind, worker_id, source_id }: gather directives
+  const directives = [];
   if (new_assignments.length > 0) {
     // dict: resource name -> how many workers were assigned there this pass
     const assigned_count_by_resource = {};
@@ -440,7 +442,11 @@ function manageWorkers(worker_state, game_state, turn) {
       // Entity or undefined: source it should gather
       const source = game_state.getEntityById(pair.source_id);
       if (!worker || !source) continue;
-      orders.push(pair);
+      directives.push({
+        kind: "gather",
+        worker_id: pair.worker_id,
+        source_id: pair.source_id,
+      });
       // object { generic, specific }: type of the chosen source
       const supply_type = source.resourceSupplyType();
       assignment_by_worker_id[pair.worker_id] = {
@@ -463,8 +469,44 @@ function manageWorkers(worker_state, game_state, turn) {
       measured_rate_by_worker_id,
       last_delivery_time_by_worker_id,
     },
-    orders: orders,
+    directives: directives,
+    requests: [],
   };
+}
+
+/**
+ * The spending manager, pure. v1 approves every request and dispatches on
+ * kind; only "construct" is wired, converted into a construction order in
+ * the building layer's vocabulary (no key, cost, or detail). Unfulfilled
+ * requests are dropped at end of turn: passes re-emit while the need
+ * persists, and must count "already paid for" as "need satisfied".
+ * @param {Array<{key: string, kind: string, payload: object,
+ *   cost: object, builders: Array<number>, detail: string}>} requests —
+ *   the spending requests emitted by every pass this turn.
+ * @returns {{construction_orders: Array<{template: string, x: number,
+ *   z: number, angle: number, builders: Array<number>}>}}
+ */
+function manageSpending(requests) {
+  // array of { template, x, z, angle, builders }
+  const construction_orders = [];
+  // object { key, kind, payload, cost, builders, detail }: one request
+  for (const request of requests) {
+    print(
+      `[HARNESS] louis-bot: spending request ${request.key} (${request.kind}): ${request.detail}\n`,
+    );
+    if (request.kind !== "construct") continue;
+    construction_orders.push({
+      template: request.payload.template,
+      x: request.payload.x,
+      z: request.payload.z,
+      angle: request.payload.angle,
+      builders: request.builders,
+    });
+    print(
+      `[HARNESS] louis-bot: approved ${request.key}, construction order for ${request.payload.template}\n`,
+    );
+  }
+  return { construction_orders };
 }
 
 /**
@@ -497,16 +539,27 @@ LouisBot.prototype.OnUpdate = function () {
   //   measured_rate_by_worker_id, last_delivery_time_by_worker_id }
   const worker_state = this.worker_state ?? saved_state?.worker_state ?? {};
 
-  // object: { state, orders }: the worker pass result
+  // object: { state, directives, requests }: the worker pass result
   const worker_result = manageWorkers(worker_state, game_state, turn);
   this.worker_state = worker_result.state;
-  // object { worker_id, source_id }: one gather order
-  for (const order of worker_result.orders) {
-    // Entity or undefined: worker to order
-    const worker = game_state.getEntityById(order.worker_id);
-    // Entity or undefined: source it should gather
-    const source = game_state.getEntityById(order.source_id);
-    if (worker && source) worker.gather(source);
+
+  // array of spending request objects: from every pass
+  const requests = [...worker_result.requests];
+  // object { construction_orders: array }: kept for the building manager
+  // (ticket 002), unused until then
+  const spending_result = manageSpending(requests);
+
+  // array of directive objects: from every pass
+  const directives = [...worker_result.directives];
+  // object: one directive
+  for (const directive of directives) {
+    if (directive.kind === "gather") {
+      // Entity or undefined: worker to order
+      const worker = game_state.getEntityById(directive.worker_id);
+      // Entity or undefined: source it should gather
+      const source = game_state.getEntityById(directive.source_id);
+      if (worker && source) worker.gather(source);
+    }
   }
 
   this.turn = turn + 1;
