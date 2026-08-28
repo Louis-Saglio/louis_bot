@@ -1,78 +1,11 @@
-// number: meters; two wood supplies closer than this belong to one cluster
-const CLUSTER_RADIUS = 30;
-// number: meters; a cluster is covered when a wood dropsite, built or
-// foundation, sits this close to the cluster centroid
-const DROPOFF_COVERAGE_RADIUS = 40;
-// number: remaining wood below which a cluster never justifies a storehouse
-const MIN_CLUSTER_SUPPLY = 1500;
-// number: meters; how far from the centroid the placement search may wander
-const DROPOFF_SEARCH_RADIUS = 40;
-// number: meters; step between candidate spots in the placement search
+// number: meters; a chopped tree is covered when a wood dropsite, built or
+// foundation, sits this close to it, and the placement search wanders this
+// far from the tree
+const DROPOFF_RADIUS = 40;
+// number: meters; step between candidate rings in the placement search
 const DROPOFF_SEARCH_STEP = 2;
-
-function clusterSupplies(supplies) {
-  // array of { id, x, z, amount }
-  const sorted = [...supplies].sort((a, b) => a.id - b.id);
-  // array of number: union-find parent per supply index
-  const parent = sorted.map((unused, i) => i);
-
-  function find(i) {
-    while (parent[i] !== i) {
-      parent[i] = parent[parent[i]];
-      i = parent[i];
-    }
-    return i;
-  }
-
-  // number: outer supply index
-  for (let i = 0; i < sorted.length; i++) {
-    // number: inner supply index
-    for (let j = i + 1; j < sorted.length; j++) {
-      // number: squared distance between the two supplies
-      const dist2 =
-        (sorted[i].x - sorted[j].x) * (sorted[i].x - sorted[j].x) +
-        (sorted[i].z - sorted[j].z) * (sorted[i].z - sorted[j].z);
-      if (dist2 > CLUSTER_RADIUS * CLUSTER_RADIUS) continue;
-      // number: roots of both supplies
-      const root_i = find(i);
-      const root_j = find(j);
-      if (root_i !== root_j) parent[root_i] = root_j;
-    }
-  }
-
-  // dict: root index -> { supply_ids, supply_sum, weight_x, weight_z }
-  const accumulator_by_root = {};
-  // number: supply index
-  for (let i = 0; i < sorted.length; i++) {
-    // number: root of this supply
-    const root = find(i);
-    if (!accumulator_by_root[root])
-      accumulator_by_root[root] = {
-        supply_ids: [],
-        supply_sum: 0,
-        weight_x: 0,
-        weight_z: 0,
-      };
-    // object: the cluster accumulator
-    const accumulator = accumulator_by_root[root];
-    accumulator.supply_ids.push(sorted[i].id);
-    accumulator.supply_sum += sorted[i].amount;
-    accumulator.weight_x += sorted[i].x * sorted[i].amount;
-    accumulator.weight_z += sorted[i].z * sorted[i].amount;
-  }
-
-  // array of cluster records
-  const clusters = [];
-  // object: one cluster accumulator
-  for (const accumulator of Object.values(accumulator_by_root))
-    clusters.push({
-      supply_ids: accumulator.supply_ids,
-      supply_sum: accumulator.supply_sum,
-      x: accumulator.weight_x / accumulator.supply_sum,
-      z: accumulator.weight_z / accumulator.supply_sum,
-    });
-  return clusters;
-}
+// number: candidate spots per search ring
+const DROPOFF_SEARCH_STEPS_PER_RING = 16;
 
 function isBuildableSpot(game_state, x, z, half_size) {
   // object: { data, width, height, cellSize }
@@ -93,12 +26,12 @@ function isBuildableSpot(game_state, x, z, half_size) {
         cell_z >= passability.height
       )
         return false;
-      // number: cell index
+      // number: cell index in the passability grid
       const cell = cell_x + cell_z * passability.width;
       if (passability.data[cell] & blocked_mask) return false;
     }
   }
-  // object: { data, width, height, cellSize }
+  // object: { data, width, cellSize }
   const territory = game_state.sharedScript.territoryMap;
   // number: territory cell index of the candidate center
   const territory_cell =
@@ -114,58 +47,72 @@ function isBuildableSpot(game_state, x, z, half_size) {
   return (territory.data[territory_cell] & 0x1f) === game_state.player;
 }
 
-function findDropoffSpot(game_state, cx, cz, half_size, rejected_positions) {
-  // number: distance of the current candidate ring from the centroid
-  for (
-    let radius = 0;
-    radius <= DROPOFF_SEARCH_RADIUS;
-    radius += DROPOFF_SEARCH_STEP
-  ) {
+function findDropoffSpot(game_state, tree, half_size, rejected) {
+  // number: distance of the current candidate ring from the tree
+  for (let radius = 0; radius <= DROPOFF_RADIUS; radius += DROPOFF_SEARCH_STEP) {
     // number: how many candidates sit on this ring; 1 for the center
-    const steps = radius === 0 ? 1 : 16;
+    const steps = radius === 0 ? 1 : DROPOFF_SEARCH_STEPS_PER_RING;
     // number: candidate index on this ring
     for (let step = 0; step < steps; step++) {
       // number: candidate coordinates
-      const x = cx + radius * Math.cos((step * 2 * Math.PI) / steps);
-      const z = cz + radius * Math.sin((step * 2 * Math.PI) / steps);
+      const x = tree.x + radius * Math.cos((step * 2 * Math.PI) / steps);
+      const z = tree.z + radius * Math.sin((step * 2 * Math.PI) / steps);
       // boolean: whether this spot already failed
-      const is_rejected = rejected_positions.some(
-        (rejected) =>
-          (rejected.x - x) * (rejected.x - x) +
-            (rejected.z - z) * (rejected.z - z) <
+      const is_rejected = rejected.some(
+        (rejected_spot) =>
+          (rejected_spot.x - x) * (rejected_spot.x - x) +
+            (rejected_spot.z - z) * (rejected_spot.z - z) <
           1,
       );
       if (is_rejected) continue;
-      if (isBuildableSpot(game_state, x, z, half_size))
-        return { x: x, z: z };
+      if (isBuildableSpot(game_state, x, z, half_size)) return { x: x, z: z };
     }
   }
   return undefined;
 }
 
-export function applyDropoffsStrategy(
-  dropoff_state,
-  assignment_by_worker_id,
-  game_state,
-) {
-  // array of { id, x, z, amount }
-  const supplies = [];
+export function applyDropoffsStrategy(dropoff_state, game_state) {
+  // dict: wood supply id -> { id, x, z }, for order target lookup
+  const supply_by_id = {};
   // Entity: one wood supply
   for (const supply of game_state.getResourceSupplies("wood").values()) {
     // [number, number] or undefined: supply position, [x, z]
     const pos = supply.position();
-    if (!pos) continue;
-    // number: remaining wood on this supply
-    const amount = supply.resourceSupplyAmount();
-    if (amount <= 0) continue;
-    supplies.push({ id: supply.id(), x: pos[0], z: pos[1], amount: amount });
+    if (!pos || supply.resourceSupplyAmount() <= 0) continue;
+    // object: { id, x, z }
+    const record = { id: supply.id(), x: pos[0], z: pos[1] };
+    supply_by_id[record.id] = record;
   }
-  // array of cluster records
-  const clusters = clusterSupplies(supplies);
 
-  // array of { x, z }
+  // array of { supply, choppers }: wood supplies being chopped, in
+  // deterministic order, one entry per tree however many choppers it has
+  const chopped = [];
+  // Entity: one own unit
+  for (const unit of game_state.getOwnUnits().toEntityArray()) {
+    // array of order data objects: the unit's order queue
+    const orders = unit.unitAIOrderData();
+    if (!orders || orders.length === 0) continue;
+    // number or undefined: entity id the current order targets
+    const target_id = orders[0].target;
+    // object or undefined: the wood supply under this order, if any
+    const supply = supply_by_id[target_id];
+    if (supply === undefined) continue;
+    // object or undefined: this tree's entry in the chopped list
+    let entry;
+    // object: one chopped-tree entry
+    for (const candidate of chopped)
+      if (candidate.supply.id === supply.id) entry = candidate;
+    if (entry === undefined) {
+      entry = { supply: supply, choppers: [] };
+      chopped.push(entry);
+    }
+    entry.choppers.push(unit.id());
+  }
+  chopped.sort((a, b) => a.supply.id - b.supply.id);
+
+  // array of { x, z }: wood dropsites, built or foundation
   const dropsites = [];
-  // array of { x, z }
+  // array of { x, z }: foundations of any kind, for attempt matching
   const foundations = [];
   // Entity: one own structure
   for (const structure of game_state.getOwnStructures().values()) {
@@ -225,52 +172,32 @@ export function applyDropoffsStrategy(
       rejected.push(attempted_spot);
   }
 
-  // dict: source id -> array of worker ids
-  const worker_ids_by_source_id = {};
-  // [string, object]: worker id and its assignment record
-  for (const [worker_id, assignment] of Object.entries(
-    assignment_by_worker_id,
-  )) {
-    if (!worker_ids_by_source_id[assignment.source_id])
-      worker_ids_by_source_id[assignment.source_id] = [];
-    worker_ids_by_source_id[assignment.source_id].push(+worker_id);
-  }
-
-  // array of spending request objects
+  // array of spending request objects; at most one per turn
   const requests = [];
   // array of { x, z }
   const attempted = [];
-  // object: one cluster record
-  for (const cluster of clusters) {
-    if (cluster.supply_sum < MIN_CLUSTER_SUPPLY) continue;
-    // array of number: ids of workers gathering in this cluster
-    const builders = [];
-    // number: one supply id of the cluster
-    for (const supply_id of cluster.supply_ids)
-      // number: one worker id assigned to this supply
-      for (const worker_id of worker_ids_by_source_id[supply_id] || [])
-        builders.push(worker_id);
-    if (builders.length === 0) continue;
-    // boolean: whether a dropsite already serves this cluster
+  // object: one chopped-tree entry; stop after the first emitted request
+  for (const entry of chopped) {
+    // boolean: whether a dropsite already serves this tree
     const covered = dropsites.some(
       (dropsite) =>
-        (dropsite.x - cluster.x) * (dropsite.x - cluster.x) +
-          (dropsite.z - cluster.z) * (dropsite.z - cluster.z) <
-        DROPOFF_COVERAGE_RADIUS * DROPOFF_COVERAGE_RADIUS,
+        (dropsite.x - entry.supply.x) * (dropsite.x - entry.supply.x) +
+          (dropsite.z - entry.supply.z) * (dropsite.z - entry.supply.z) <
+        DROPOFF_RADIUS * DROPOFF_RADIUS,
     );
     if (covered) continue;
     // object: { x, z } or undefined
     const spot = findDropoffSpot(
       game_state,
-      cluster.x,
-      cluster.z,
+      entry.supply,
       half_size,
       rejected,
     );
     if (!spot) continue;
     requests.push({
-      key: "dropsite:wood:cluster-" + cluster.supply_ids[0],
+      key: "dropsite:wood:tree-" + entry.supply.id,
       kind: "construct",
+      priority: 3,
       payload: {
         template: template_name,
         x: spot.x,
@@ -278,17 +205,15 @@ export function applyDropoffsStrategy(
         angle: 0,
       },
       cost: storehouse_cost,
-      builders: builders,
+      builders: entry.choppers,
       detail:
-        "woodline dropsite for a cluster of " +
-        cluster.supply_ids.length +
-        " supplies at (" +
-        cluster.x.toFixed(0) +
-        ", " +
-        cluster.z.toFixed(0) +
-        ")",
+        "woodline dropsite for " +
+        entry.choppers.length +
+        " choppers on tree " +
+        entry.supply.id,
     });
     attempted.push({ x: spot.x, z: spot.z });
+    break;
   }
   return {
     state: { attempted: attempted, rejected: rejected },

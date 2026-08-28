@@ -378,6 +378,14 @@ export function applyGatheringStrategy(gathering_state, game_state, turn) {
   return {
     state: {
       assignment_by_worker_id,
+      // dict: priority -> ids of the units this strategy owns at that
+      // priority; the public ownership record, distinct from the private
+      // assignment detail above. Gathering holds everything at priority 1.
+      owned_unit_ids_by_priority: {
+        1: Object.keys(assignment_by_worker_id)
+          .map(Number)
+          .sort((a, b) => a - b),
+      },
       carried_amount_by_worker_id,
       measured_rate_by_worker_id,
       last_delivery_time_by_worker_id,

@@ -46,11 +46,7 @@ LouisBot.prototype.OnUpdate = function () {
   const gathering_result = applyGatheringStrategy(gathering_state, game_state, turn);
 
   // object: { state, requests }
-  const dropoff_result = applyDropoffsStrategy(
-    dropoff_state,
-    gathering_result.state.assignment_by_worker_id,
-    game_state,
-  );
+  const dropoff_result = applyDropoffsStrategy(dropoff_state, game_state);
 
   // object: { requests }
   const population_result = applyPopulationStrategy(game_state);
