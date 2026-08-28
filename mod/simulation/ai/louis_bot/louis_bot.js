@@ -1,8 +1,10 @@
 import { BaseAI } from "simulation/ai/common-api/baseAI.js";
 import { applyGatheringStrategy } from "simulation/ai/louis_bot/gathering_strategy.js";
 import { applyDropoffsStrategy } from "simulation/ai/louis_bot/dropoffs_strategy.js";
+import { applyPopulationStrategy } from "simulation/ai/louis_bot/population_strategy.js";
 import { allocateBudget } from "simulation/ai/louis_bot/budget_allocation.js";
 import { executeConstruction } from "simulation/ai/louis_bot/construction_execution.js";
+import { executeTraining } from "simulation/ai/louis_bot/training_execution.js";
 
 // number: the bot plays every that many turns
 const PLAY_EVERY_N_TURN = 8;
@@ -50,9 +52,16 @@ LouisBot.prototype.OnUpdate = function () {
     game_state,
   );
 
+  // object: { requests }
+  const population_result = applyPopulationStrategy(game_state);
+
   // array of spending request objects
-  const requests = [...gathering_result.requests, ...dropoff_result.requests];
-  // object: { construction_orders }
+  const requests = [
+    ...gathering_result.requests,
+    ...dropoff_result.requests,
+    ...population_result.requests,
+  ];
+  // object: { construction_orders, training_orders }
   const budget_result = allocateBudget(requests);
 
   // object: { state, directives }
@@ -62,10 +71,14 @@ LouisBot.prototype.OnUpdate = function () {
     game_state,
   );
 
+  // object: { directives }
+  const training_result = executeTraining(budget_result.training_orders);
+
   // array of directive objects
   const directives = [
     ...gathering_result.directives,
     ...construction_result.directives,
+    ...training_result.directives,
   ];
   // object: one directive
   for (const directive of directives) {
@@ -91,6 +104,16 @@ LouisBot.prototype.OnUpdate = function () {
       // Entity or undefined
       const foundation = game_state.getEntityById(directive.foundation_id);
       if (builder && foundation) builder.repair(foundation);
+    } else if (directive.kind === "train") {
+      // Entity or undefined
+      const trainer = game_state.getEntityById(directive.trainer_id);
+      if (trainer)
+        trainer.train(
+          game_state.getPlayerCiv(),
+          directive.template,
+          directive.count,
+          null,
+        );
     }
   }
 
