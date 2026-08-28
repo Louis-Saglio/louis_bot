@@ -84,6 +84,10 @@ LouisBot.prototype.OnUpdate = function () {
       // Entity or undefined
       const source = game_state.getEntityById(directive.source_id);
       if (worker && source) worker.gather(source);
+    } else if (directive.kind === "stop") {
+      // Entity or undefined
+      const worker = game_state.getEntityById(directive.worker_id);
+      if (worker) worker.stopMoving();
     } else if (directive.kind === "construct") {
       // Entity or undefined
       const poster = game_state.getEntityById(directive.builder_id);
