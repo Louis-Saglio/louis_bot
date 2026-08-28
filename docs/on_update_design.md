@@ -18,9 +18,12 @@ Passes return their next state as plain structured-cloneable data; `OnUpdate`
 stores it and `Serialize`/`Deserialize` persists it.
 
 Currently built: `gathering_strategy.js` (assigns idle gatherers, measures
-rates), `dropoffs_strategy.js` (requests storehouses for uncovered wood
-clusters), `budget_allocation.js` (approve-all compromiser),
-`construction_execution.js` (foundations and builders).
+rates, publishes `owned_unit_ids_by_priority`), `dropoffs_strategy.js`
+(requests a storehouse near any chopped tree with no dropsite within 40 m),
+`population_strategy.js` (requests one civilian when the civil center's
+queue is empty), `budget_allocation.js` (approve-all compromiser),
+`construction_execution.js` (foundations and builders),
+`training_execution.js` (unit training).
 
 ## The allocation design (agreed, not yet built)
 
@@ -52,27 +55,43 @@ This section records the target design for resource and unit allocation.
 A unit is in exactly one of two places:
 
 - **Owned** by one strategy, because that strategy is using it right now.
-  Represented as a standard `owned_unit_ids` list of entity ids in each
-  strategy's state. The compromiser mutates these lists between turns.
+  Represented as a standard `owned_unit_ids_by_priority` dict in each
+  strategy's state: priority level -> sorted list of entity ids. A strategy
+  may hold different units at different priorities. The compromiser mutates
+  these dicts between turns.
 - **Un-owned**, meaning in the pool. The pool has no representation: it is
-  `getOwnUnits()` minus the union of all `owned_unit_ids`. Pool units gather
-  by default (gathering is the residual claimant, not a requester), and any
-  of them can be taken at any time.
+  `getOwnUnits()` minus the union of all buckets of all strategies. Freshly
+  trained units land in the pool.
+
+Gathering is an owner like any other strategy: it holds its assigned
+workers at priority 1, because it uses them continuously and pays a real
+cost (walking time, lost rate history) when one is pulled away. It is the
+largest holder, not a special case.
 
 Ownership is soft. The compromiser prefers pool units, but when a request
-cannot be served from the pool it may take owned units from a lower-priority
-use. The owner's re-emitted owning request states what the units are doing
-and at what priority; the new request outranks it or goes unsatisfied.
+cannot be served from the pool it takes owned units from the lowest-priority
+buckets across all strategies. A unit's holding priority is a fact stored
+in its owner's bucket, not inferred from re-emitted requests.
+
+Owned units leave their bucket in exactly three ways: the strategy stops
+re-emitting the owning request (the claim lapses, units return to the pool;
+a crashed strategy cannot squat on units forever), the compromiser steals
+them, or they die.
 
 There is a one-turn lag between grant and use: the compromiser adds units to
-a strategy's list at end of turn T, the strategy sees them and can emit
+a strategy's bucket at end of turn T, the strategy sees them and can emit
 directives for them at turn T+1. Requests acquire, directives use, never in
 the same turn.
 
 **Readiness** is a standing demand, not a hold: "keep 10 archers in
-existence." Ready units stay in the pool and gather. Several strategies may
-be satisfied by the same group; when one of them owns the group away, the
-others' readiness fails next turn and they re-emit.
+existence." A readiness request carries an **escalation priority**, the
+priority the strategy would claim at if it actually needed the units. A
+unit counts toward a readiness request when it is un-owned (priority 0) or
+held strictly below the escalation priority: readiness means "this unit
+would be mine if I escalated right now." Gathering's priority-1 workers
+therefore count as ready for almost everyone. Several strategies may be
+satisfied by the same group; when one of them escalates and owns the group
+away, the others' readiness fails next turn and they re-emit.
 
 ### Request shapes
 
@@ -121,7 +140,9 @@ Readiness request (keep units in existence, hold nothing):
 {
   key: "defense:home-archers",  // string: stable id
   capability: "archer",         // string: matched against template classes
-  count: 10,                    // number: units that should exist un-owned
+  count: 10,                    // number: units that should be available
+  escalation_priority: 4,       // number: 1-5; a unit counts when un-owned
+                                // or held strictly below this priority
   detail: "anti-ram reserve"    // string: logs only
 }
 ```
@@ -138,17 +159,21 @@ enforcement. Priority 0 means the request is useless; do not emit it.
 
 1. Read every strategy's result: directives, spending requests, owning
    requests, readiness requests.
-2. Compute the pool from all `owned_unit_ids` lists and game state.
-3. Check readiness: per capability, count pool units, list watcher keys,
-   compute the missing count. The demand table (pool count, watchers,
-   missing) is part of the compromiser's turn output.
+2. Compute the pool from game state and the union of every strategy's
+   `owned_unit_ids_by_priority` buckets.
+3. Check readiness: per request, count matching units that are un-owned or
+   held strictly below the request's escalation priority. Aggregate into
+   the demand table (per capability: available count, watcher keys, missing
+   count), which is part of the compromiser's turn output.
 4. Fill owning requests by descending priority, from the pool first. When
-   the pool is short, steal owned units from lower-priority uses. Prefer
-   incumbents: a re-emitted request keeps its units.
+   the pool is short, steal owned units from the lowest-priority buckets,
+   strictly below the request's priority. Prefer incumbents: a re-emitted
+   request keeps its units.
 5. Approve spending requests by descending priority against remaining stock,
    population headroom, and unit requirements, lending pool units into
    `unit_candidates` when the emitter's own units fall short.
-6. Mutate every strategy's `owned_unit_ids` to reflect grants and thefts.
+6. Mutate every strategy's `owned_unit_ids_by_priority` to reflect grants,
+   lapses, and thefts.
 7. Convert approved spending requests into orders for the executors.
 
 ### The population strategy
