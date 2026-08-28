@@ -33,17 +33,15 @@ LouisBot.prototype.OnUpdate = function () {
   const turn = this.turn;
   // object or undefined: state stashed by Deserialize
   const saved_state = this.saved_state;
-  // object: { assignment_by_worker_id, carried_amount_by_worker_id,
-  //   measured_rate_by_worker_id, last_delivery_time_by_worker_id }
+  // object: { assignment_by_worker_id, owned_unit_ids_by_priority,
+  //   carried_amount_by_worker_id, measured_rate_by_worker_id,
+  //   last_delivery_time_by_worker_id }
   const gathering_state = this.gathering_state ?? saved_state?.gathering_state ?? {};
   // object: { builder_ids_by_foundation_id, pending_placements }
   const construction_state =
     this.construction_state ?? saved_state?.construction_state ?? {};
   // object: { attempted, rejected }
   const dropoff_state = this.dropoff_state ?? saved_state?.dropoff_state ?? {};
-
-  // object: { state, directives, requests }
-  const gathering_result = applyGatheringStrategy(gathering_state, game_state, turn);
 
   // object: { state, requests }
   const dropoff_result = applyDropoffsStrategy(dropoff_state, game_state);
@@ -53,12 +51,26 @@ LouisBot.prototype.OnUpdate = function () {
 
   // array of spending request objects
   const requests = [
-    ...gathering_result.requests,
     ...dropoff_result.requests,
     ...population_result.requests,
   ];
-  // object: { construction_orders, training_orders }
-  const budget_result = allocateBudget(requests);
+  // object: { construction_orders, training_orders,
+  //   owned_unit_ids_by_priority }; the compromiser approves spending and
+  //   grants pool units to gathering
+  const budget_result = allocateBudget(requests, game_state, gathering_state);
+
+  // object: gathering state with the compromiser's unit grants applied
+  const granted_gathering_state = {
+    ...gathering_state,
+    owned_unit_ids_by_priority: budget_result.owned_unit_ids_by_priority,
+  };
+
+  // object: { state, directives, requests }
+  const gathering_result = applyGatheringStrategy(
+    granted_gathering_state,
+    game_state,
+    turn,
+  );
 
   // object: { state, directives }
   const construction_result = executeConstruction(

@@ -1,6 +1,6 @@
 {
 	"name": "Louis — bot",
-	"description": "Assigns idle workers to resource sources, balancing food and wood against measured gather rates. Does not build anything yet.",
+	"description": "Gathers food and wood, preferring safe sources inside its own territory and balancing rates against measured deliveries. Builds storehouses near uncovered woodlines and trains civilians.",
 	"constructor": "LouisBot",
 	"filename": "louis_bot.js",
 	"useShared": true

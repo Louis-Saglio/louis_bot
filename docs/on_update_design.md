@@ -17,17 +17,21 @@ The bot is a set of pure decision passes wired together in `OnUpdate`
 Passes return their next state as plain structured-cloneable data; `OnUpdate`
 stores it and `Serialize`/`Deserialize` persists it.
 
-Currently built: `gathering_strategy.js` (assigns idle gatherers, measures
-rates, publishes `owned_unit_ids_by_priority`), `dropoffs_strategy.js`
+Currently built: `gathering_strategy.js` (bucket-driven: works the units the
+compromiser grants, measures rates), `dropoffs_strategy.js`
 (requests a storehouse near any chopped tree with no dropsite within 40 m),
 `population_strategy.js` (requests one civilian when the civil center's
-queue is empty), `budget_allocation.js` (approve-all compromiser),
+queue is empty), `budget_allocation.js` (compromiser: approves spending,
+grants pool units to gathering),
 `construction_execution.js` (foundations and builders),
 `training_execution.js` (unit training).
 
-## The allocation design (agreed, not yet built)
+## The allocation design
 
 This section records the target design for resource and unit allocation.
+Built so far: the pool (`getOwnUnits()` minus every strategy's buckets) and
+the grant of pool units to gathering. Not yet built: owning requests,
+readiness requests, priority-based stealing.
 
 ### Principles
 
@@ -78,10 +82,10 @@ re-emitting the owning request (the claim lapses, units return to the pool;
 a crashed strategy cannot squat on units forever), the compromiser steals
 them, or they die.
 
-There is a one-turn lag between grant and use: the compromiser adds units to
-a strategy's bucket at end of turn T, the strategy sees them and can emit
-directives for them at turn T+1. Requests acquire, directives use, never in
-the same turn.
+Grants are usable in the same turn: the compromiser adds pool units to
+gathering's bucket and gathering assigns them to sources in the same
+`OnUpdate`. The one-turn lag between grant and use from the original design
+was dropped while gathering is the only unit consumer.
 
 **Readiness** is a standing demand, not a hold: "keep 10 archers in
 existence." A readiness request carries an **escalation priority**, the
@@ -110,12 +114,14 @@ Spending / action request (construct, train, research, barter, tribute):
   population_cost: 0,              // number: headroom consumed under the cap
   units_min: 2,                    // number: below this the action is useless
   units_ideal: 4,                  // number: beyond this no added value
-  unit_candidates: [/* entity ids */],  // array: defaults to the emitter's
-                                        // own units; empty means the
-                                        // compromiser must supply them
+  unit_candidates: [/* entity ids */],  // array: the emitter's own units to
+                                        // use; an empty list rejects the
+                                        // request
   lifetime: "task",                // string: "purchase" (stock leaves once,
-                                   // units stay), "task" (units return when
-                                   // done), "standing" (held while re-emitted)
+                                   // units stay), "task" (units are borrowed,
+                                   // never leave their bucket, and are freed
+                                   // by idleness when done), "standing"
+                                   // (held while re-emitted)
   detail: "woodline dropsite for cluster 7"  // string: logs only
 }
 ```

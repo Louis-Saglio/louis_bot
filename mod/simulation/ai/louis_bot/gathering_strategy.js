@@ -312,6 +312,21 @@ export function applyGatheringStrategy(gathering_state, game_state, turn) {
   let last_delivery_time_by_worker_id =
     gathering_state.last_delivery_time_by_worker_id || {};
 
+  // array of number: unit ids this strategy owns; the compromiser writes
+  // this bucket between turns, gathering never scans the engine for units
+  const owned_unit_ids = Object.values(
+    gathering_state.owned_unit_ids_by_priority || {},
+  ).flat();
+  // array of number: owned unit ids still alive
+  const live_owned_ids = [];
+  // array of string: owned unit ids whose entity is gone
+  const dead_worker_ids = [];
+  // number: one owned unit id
+  for (const unit_id of owned_unit_ids) {
+    if (game_state.getEntityById(unit_id)) live_owned_ids.push(unit_id);
+    else dead_worker_ids.push(String(unit_id));
+  }
+
   // number: current simulation time in milliseconds
   const time_ms = game_state.getTimeElapsed();
 
@@ -430,7 +445,7 @@ export function applyGatheringStrategy(gathering_state, game_state, turn) {
     carried_amount_by_worker_id,
     measured_rate_by_worker_id,
     last_delivery_time_by_worker_id,
-    dropped_ids,
+    dropped_ids.concat(dead_worker_ids),
   ));
 
   ({
@@ -512,22 +527,26 @@ export function applyGatheringStrategy(gathering_state, game_state, turn) {
       }
     }
 
-  // array of { id: number, template_rates: object }: workers needing a
-  // source, idle ones plus those recalled from ineligible sources
-  const idle_gatherers = game_state
-    .getOwnUnits()
-    .toEntityArray()
-    .filter(
-      (ent) =>
-        ent.isGatherer() &&
-        ent.isIdle() &&
-        ent.position() &&
-        assignment_by_worker_id[ent.id()] === undefined,
+  // array of { id: number, template_rates: object }: owned workers needing a
+  // source, idle ones plus those recalled from ineligible sources; borrowed
+  // builders are not idle, so they keep building undisturbed
+  const idle_gatherers = [];
+  // number: one owned unit id, alive by construction of live_owned_ids
+  for (const unit_id of live_owned_ids) {
+    // Entity: the owned unit
+    const ent = game_state.getEntityById(unit_id);
+    if (
+      !ent.isGatherer() ||
+      !ent.isIdle() ||
+      !ent.position() ||
+      assignment_by_worker_id[unit_id] !== undefined
     )
-    .map((ent) => ({
-      id: ent.id(),
+      continue;
+    idle_gatherers.push({
+      id: unit_id,
       template_rates: ent.resourceGatherRates(),
-    }));
+    });
+  }
   // string: recalled worker id
   for (const worker_id of recalled_ids) {
     // Entity or undefined: alive by construction of recalled_ids
@@ -592,12 +611,10 @@ export function applyGatheringStrategy(gathering_state, game_state, turn) {
     state: {
       assignment_by_worker_id,
       // dict: priority -> ids of the units this strategy owns at that
-      // priority; the public ownership record, distinct from the private
-      // assignment detail above. Gathering holds everything at priority 1.
+      // priority; the bucket carries through borrowed builders and freshly
+      // granted units, it is not derived from the assignment detail above
       owned_unit_ids_by_priority: {
-        1: Object.keys(assignment_by_worker_id)
-          .map(Number)
-          .sort((a, b) => a - b),
+        1: live_owned_ids.sort((a, b) => a - b),
       },
       carried_amount_by_worker_id,
       measured_rate_by_worker_id,
