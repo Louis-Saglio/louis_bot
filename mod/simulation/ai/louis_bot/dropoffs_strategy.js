@@ -178,33 +178,6 @@ export function applyDropoffsStrategy(
       foundations.push({ x: pos[0], z: pos[1] });
   }
 
-  // array of { x, z }
-  const previously_attempted = dropoff_state.attempted || [];
-  // array of { x, z }
-  const rejected = [...(dropoff_state.rejected || [])];
-  // object: { x, z }
-  for (const attempted_spot of previously_attempted) {
-    // boolean: whether a foundation now stands on this spot
-    const placed = foundations.some(
-      (foundation) =>
-        (foundation.x - attempted_spot.x) * (foundation.x - attempted_spot.x) +
-          (foundation.z - attempted_spot.z) * (foundation.z - attempted_spot.z) <
-        1,
-    );
-    if (!placed) rejected.push(attempted_spot);
-  }
-
-  // dict: source id -> array of worker ids
-  const worker_ids_by_source_id = {};
-  // [string, object]: worker id and its assignment record
-  for (const [worker_id, assignment] of Object.entries(
-    assignment_by_worker_id,
-  )) {
-    if (!worker_ids_by_source_id[assignment.source_id])
-      worker_ids_by_source_id[assignment.source_id] = [];
-    worker_ids_by_source_id[assignment.source_id].push(+worker_id);
-  }
-
   // string: this civ's storehouse template name
   const template_name = "structures/" + game_state.getPlayerCiv() + "/storehouse";
   // Template or null
@@ -220,8 +193,48 @@ export function applyDropoffsStrategy(
     ) /
       2 +
     1;
-  // number: wood in stock
-  const wood_stock = game_state.playerData.resourceCounts.wood;
+
+  // array of { x, z }
+  const previously_attempted = dropoff_state.attempted || [];
+  // array of { x, z }: blacklisted spots, kept only while still unbuildable
+  // so territory growth or cleared obstructions give them another chance
+  const rejected = (dropoff_state.rejected || []).filter(
+    (spot) => !isBuildableSpot(game_state, spot.x, spot.z, half_size),
+  );
+  // object: { x, z }
+  for (const attempted_spot of previously_attempted) {
+    // boolean: whether a foundation now stands on this spot
+    const placed = foundations.some(
+      (foundation) =>
+        (foundation.x - attempted_spot.x) * (foundation.x - attempted_spot.x) +
+          (foundation.z - attempted_spot.z) * (foundation.z - attempted_spot.z) <
+        1,
+    );
+    // A missing foundation on a buildable spot means placement was not the
+    // problem (stock shortage, silent engine rejection), so only unbuildable
+    // spots are blacklisted
+    if (
+      !placed &&
+      !isBuildableSpot(
+        game_state,
+        attempted_spot.x,
+        attempted_spot.z,
+        half_size,
+      )
+    )
+      rejected.push(attempted_spot);
+  }
+
+  // dict: source id -> array of worker ids
+  const worker_ids_by_source_id = {};
+  // [string, object]: worker id and its assignment record
+  for (const [worker_id, assignment] of Object.entries(
+    assignment_by_worker_id,
+  )) {
+    if (!worker_ids_by_source_id[assignment.source_id])
+      worker_ids_by_source_id[assignment.source_id] = [];
+    worker_ids_by_source_id[assignment.source_id].push(+worker_id);
+  }
 
   // array of spending request objects
   const requests = [];
@@ -246,7 +259,6 @@ export function applyDropoffsStrategy(
         DROPOFF_COVERAGE_RADIUS * DROPOFF_COVERAGE_RADIUS,
     );
     if (covered) continue;
-    if (wood_stock < storehouse_cost.wood) continue;
     // object: { x, z } or undefined
     const spot = findDropoffSpot(
       game_state,
